@@ -99,7 +99,7 @@ main{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px
 .btn.danger{color:var(--bad)}
 .btn[disabled]{opacity:.45;cursor:default}
 .icon-btn{width:36px;height:36px;border-radius:10px;border:1px solid var(--line);background:var(--surface2);display:grid;place-items:center;font-size:18px;line-height:1}
-input[type=text],input[type=number],input[type=date],input[type=time],select,textarea{
+input[type=text],input[type=email],input[type=number],input[type=date],input[type=time],select,textarea{
   width:100%;border:1px solid var(--line);background:var(--surface2);border-radius:10px;padding:9px 11px;min-width:0;font-size:16px}
 textarea{resize:vertical;min-height:140px;line-height:1.5}
 label.f{display:grid;gap:4px;font-size:12px;color:var(--muted);min-width:0}
@@ -215,6 +215,7 @@ label.f{display:grid;gap:4px;font-size:12px;color:var(--muted);min-width:0}
 .sheet-in{max-width:560px;margin:0 auto;display:grid;gap:12px}
 .onb{max-width:560px;margin:0 auto;display:grid;gap:16px;padding-top:12px}
 .onb h1{font-size:26px;font-weight:800}
+.cloud{display:grid;gap:8px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--surface2)}
 .classes{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 .clsbtn{border:2px solid var(--line);background:var(--surface);border-radius:var(--r);padding:10px 6px;display:grid;justify-items:center;gap:6px;min-width:0}
 .clsbtn canvas{width:64px;height:68px;image-rendering:pixelated;background:var(--stage);border-radius:8px}
@@ -765,6 +766,7 @@ details[open]>summary::before{content:"▾ "}
 })();
 
 </script>
+<script src="cloud.js"></script>
 <script src="survivor.js"></script>
 <script>
 (function(){
@@ -835,22 +837,69 @@ function syncLabel(){return {local:"на этом устройстве",saving:"
 
 async function initCloud(){
   try{
-    if(!window.claude||!window.claude.use) return;
-    const [db,user]=await Promise.all([window.claude.use("db"),window.claude.use("user")]);
-    if(!db||!user) return;
-    const id=await user.id(); if(!id) return;
-    const base="data/users/"+id;
-    const snap=await db.collection(base).limit(1000).get();
-    S.db=db;S.base=base;S.mode="cloud";
-    if(snap.empty){ // first time in cloud: upload what this device has
-      for(const k of Object.keys(S.docs)) sched(k);
-    }else{
-      const cloud={};snap.docs.forEach(d=>{if(d.exists)cloud[d.id]=d.data()});
-      S.docs=cloud;saveLocal();
+    if(window.claude&&window.claude.use){
+      const [db,user]=await Promise.all([window.claude.use("db"),window.claude.use("user")]);
+      const id=db&&user?await user.id():null;
+      if(id){await useDb(db,"data/users/"+id,"cloud");return}
     }
-    setSync("ok");
-  }catch(e){ setSync("local") }
+    if(window.HD_CLOUD&&HD_CLOUD.user()){await useDb(HD_CLOUD.db,"docs","supa");startPull();return}
+  }catch(e){ setSync(e&&e.code==="auth"?"local":"err") }
 }
+async function useDb(db,base,mode){
+  const snap=await db.collection(base).limit(1000).get();
+  S.db=db;S.base=base;S.mode=mode;if(snap.since)S.since=snap.since;
+  if(snap.empty){ // first time in cloud: upload what this device has
+    for(const k of Object.keys(S.docs)) sched(k);
+  }else{
+    const cloud={};snap.docs.forEach(d=>{if(d.exists)cloud[d.id]=d.data()});
+    S.docs=cloud;saveLocal();
+  }
+  setSync("ok");
+}
+/* pick up changes made on other devices */
+const SINCE="hero-diary.since";
+let pullTimer=null,pulling=false;
+function startPull(){if(pullTimer)return;if(!S.since){try{S.since=localStorage.getItem(SINCE)||""}catch(e){S.since=""}}
+  pullTimer=setInterval(pull,45000);document.addEventListener("visibilitychange",()=>{if(!document.hidden)pull()})}
+async function pull(){
+  if(S.mode!=="supa"||pulling||!navigator.onLine)return;pulling=true;
+  try{const rows=await HD_CLOUD.changes(S.since);let changed=false;
+    for(const r of rows){if(r.updated_at>S.since)S.since=r.updated_at;
+      if(S.timers[r.id]||S.inflight[r.id])continue; // a local edit is on its way up, keep it
+      if(r.data==null){if(r.id in S.docs){delete S.docs[r.id];changed=true}}
+      else if(JSON.stringify(S.docs[r.id])!==JSON.stringify(r.data)){S.docs[r.id]=r.data;changed=true}}
+    try{localStorage.setItem(SINCE,S.since)}catch(e){}
+    if(changed){saveLocal();if(booted&&!U.editNote)render()}
+    if(syncState==="err")setSync("ok");
+  }catch(e){if(e&&e.code==="auth"){S.db=null;S.mode="local";setSync("local");render()}}
+  pulling=false}
+
+/* ---------- cloud login (Supabase, code by email) ---------- */
+function cloudPanel(){
+  const c=U.cloud||(U.cloud={step:"email",email:"",busy:false,err:""});
+  if(S.mode==="supa"){const u=HD_CLOUD.user()||{};
+    return `<div class="cloud"><b>Облако подключено</b><span class="small muted">Вход: ${esc(u.email||"")}. Записи синхронизируются между всеми устройствами, где ты вошёл с этой почтой.</span>
+      <div class="row"><button class="btn sm" data-act="cloudPull">Обновить сейчас</button><button class="btn sm ghost" data-act="cloudOut">Выйти</button></div></div>`}
+  if(S.mode==="cloud")return "";
+  const err=c.err?`<span class="small" style="color:var(--hp)">${esc(c.err)}</span>`:"";
+  if(c.step==="code")return `<div class="cloud"><b>Код отправлен на ${esc(c.email)}</b><span class="small muted">Открой письмо и введи код из него. Письмо может попасть в «Спам».</span>
+    <div class="row"><input type="text" id="c-code" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="Код из письма" style="flex:1;min-width:0">
+    <button class="btn sm pri" data-act="cloudVerify" ${c.busy?"disabled":""}>${c.busy?"Проверяю…":"Войти"}</button></div>${err}
+    <button class="btn sm ghost" data-act="cloudBack">Другая почта</button></div>`;
+  return `<div class="cloud"><b>${prof()?"Синхронизация между устройствами":"Уже есть герой на другом устройстве?"}</b><span class="small muted">${prof()?"Войди по почте, и герой будет одинаковым на телефоне, планшете и компьютере.":"Войди по той же почте, и он появится здесь."} Пароль не нужен: пришлём код.</span>
+    <div class="row"><input type="email" id="c-email" autocomplete="email" placeholder="you@mail.ru" value="${esc(c.email)}" style="flex:1;min-width:0">
+    <button class="btn sm pri" data-act="cloudSend" ${c.busy?"disabled":""}>${c.busy?"Отправляю…":"Получить код"}</button></div>${err}</div>`}
+async function cloudSend(){const c=U.cloud;const email=(($("#c-email")||{}).value||"").trim();
+  if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){c.err="Проверь адрес почты";render();return}
+  c.email=email;c.busy=true;c.err="";render();
+  try{await HD_CLOUD.sendCode(email);c.step="code"}catch(e){c.err=e.code==="unavailable"?"Нет связи с сервером. Попробуй ещё раз.":"Не получилось отправить код: "+e.message}
+  c.busy=false;render();const i=$("#c-code");if(i)i.focus()}
+async function cloudVerify(){const c=U.cloud;const code=(($("#c-code")||{}).value||"").replace(/\s/g,"");
+  if(!code){c.err="Введи код из письма";render();return}
+  c.busy=true;c.err="";render();
+  try{await HD_CLOUD.verify(c.email,code);await useDb(HD_CLOUD.db,"docs","supa");startPull();U.cloud=null;U.lastLevel=null;toast("Облако подключено");render();return}
+  catch(e){c.err=e.code==="unavailable"?"Нет связи с сервером. Попробуй ещё раз.":e.code==="auth"||/expired|invalid/i.test(e.message)?"Код неверный или устарел. Запроси новый.":"Не получилось войти: "+e.message}
+  c.busy=false;render()}
 
 /* ---------- data accessors ---------- */
 const prof=()=>S.docs.profile;
@@ -1028,7 +1077,7 @@ function viewHero(){
   <section class="panel"><div class="panel-h"><h2>Статистика за 14 дней</h2></div>${charts()}</section>
   <section class="panel"><div class="panel-h"><h2>Достижения</h2><span class="small muted num">${got} из ${ach.length}</span></div>
     <div class="ach">${ach.map(a=>`<div class="badge ${a.ok?"on":""}"><div class="gem">${a.ok?"★":"?"}</div><div><b>${a.n}</b><span>${a.d}${!a.ok&&a.p?" · "+a.p:""}</span></div></div>`).join("")}</div></section>
-  <section class="panel"><details><summary>Настройки героя</summary>
+  <section class="panel"><details id="settings" ${U.setOpen?"open":""}><summary>Настройки героя</summary>
     <div style="display:grid;gap:12px;margin-top:12px">
       <div class="grid2">
         <label class="f">Имя героя<input type="text" id="s-name" data-chg="setName" value="${esc(p.name)}" maxlength="40"></label>
@@ -1041,7 +1090,8 @@ function viewHero(){
         <button class="btn sm" data-act="import">Восстановить из файла</button>
         <button class="btn sm danger" data-act="reset">${U.confirm==="reset"?"Точно удалить всё?":"Начать заново"}</button>
       </div>
-      <p class="small muted" style="margin:0">${S.mode==="cloud"?"Записи хранятся в твоём аккаунте Claude и видны только тебе. Открой эту страницу на любом устройстве — герой будет тот же.":"Записи сейчас хранятся только в этом браузере. Делай резервную копию время от времени."}</p>
+      ${cloudPanel()}
+      <p class="small muted" style="margin:0">${S.mode==="supa"?"Копия записей хранится и на этом устройстве, так что дневник работает и без интернета.":S.mode==="cloud"?"Записи хранятся в твоём аккаунте Claude и видны только тебе. Открой эту страницу на любом устройстве — герой будет тот же.":"Записи сейчас хранятся только в этом браузере. Делай резервную копию время от времени."}</p>
     </div></details></section>`;
 }
 function charts(){
@@ -1250,7 +1300,8 @@ function renderOnboarding(){
     <div style="display:grid;gap:8px"><span class="small muted">Класс даёт бонус к одной характеристике</span>
     <div class="classes">${Object.entries(CLASSES).map(([k,c])=>`<button class="clsbtn ${U.onbCls===k?"on":""}" data-act="onbCls" data-v="${k}"><canvas data-hero data-cls="${k}" data-lv="5" data-hp="100"></canvas><b>${c.n}</b><span>${c.d}</span></button>`).join("")}</div></div>
     <button class="btn pri" data-act="create" style="padding:14px">Начать приключение</button>
-    <button class="btn ghost sm" data-act="import">У меня есть резервная копия</button></div>`;
+    <button class="btn ghost sm" data-act="import">У меня есть резервная копия</button>
+    ${cloudPanel()}</div>`;
   $("#app").querySelectorAll("canvas[data-hero]").forEach(cv=>drawHero(cv,cv.dataset.cls,+cv.dataset.lv,+cv.dataset.hp));
 }
 
@@ -1439,6 +1490,11 @@ function act(a,v,el){
   case "closeNote":{const id=U.editNote;clearTimeout(noteTimer);const n=S.docs[id];if(n){if(!n.title.trim()&&!n.body.trim())del(id);else put(id,n)}U.editNote=null;render();break}
   case "pinNote":{const n=S.docs[U.editNote];if(n){n.pin=!n.pin;put(U.editNote,n);renderNoteSheet()}break}
   case "delNote":if(U.confirm==="note"){U.confirm=null;del(U.editNote);U.editNote=null;render()}else{U.confirm="note";renderNoteSheet();setTimeout(()=>{if(U.confirm==="note"){U.confirm=null;if(U.editNote)renderNoteSheet()}},3500)}break;
+  case "cloudSend":cloudSend();break;
+  case "cloudVerify":cloudVerify();break;
+  case "cloudBack":U.cloud={step:"email",email:U.cloud?U.cloud.email:"",busy:false,err:""};render();break;
+  case "cloudPull":pull().then(()=>toast("Синхронизировано"));break;
+  case "cloudOut":if(confirm2("cloudOut")){HD_CLOUD.signOut();clearInterval(pullTimer);pullTimer=null;S.db=null;S.mode="local";setSync("local");toast("Ты вышел. Записи остались на этом устройстве.");render()}else toast("Нажми «Выйти» ещё раз, чтобы подтвердить");break;
   case "export":download("dnevnik-geroya-"+today()+".json",JSON.stringify({app:"hero-diary",v:1,exported:new Date().toISOString(),docs:S.docs},null,1),"application/json");break;
   case "import":$("#importFile").value="";$("#importFile").click();break;
   case "sqClaim":claimSys(v);break;
@@ -1471,6 +1527,7 @@ function chg(a,el){
   }
 }
 document.addEventListener("click",e=>{const t=e.target.closest("[data-act]");if(!t||t.disabled)return;e.preventDefault();act(t.dataset.act,t.dataset.v,t)});
+document.addEventListener("toggle",e=>{if(e.target.id==="settings")U.setOpen=e.target.open},true);
 document.addEventListener("change",e=>{const t=e.target.closest("[data-chg]");if(t)chg(t.dataset.chg,t)});
 document.addEventListener("input",e=>{const t=e.target;if(t.dataset&&t.dataset.inp==="noteQ"){U.noteQ=t.value;const pos=t.selectionStart;render();const n=$("#n-search");if(n){n.focus();try{n.setSelectionRange(pos,pos)}catch(_){}}}});
 // restore drafts after re-render
